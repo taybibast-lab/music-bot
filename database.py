@@ -1,0 +1,209 @@
+import sqlite3
+from datetime import datetime
+
+DB_PATH = "music_bot.db"
+
+
+def init_db():
+    """Создаёт таблицы, если их нет."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            joined_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS likes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            query TEXT,
+            title TEXT,
+            file_id TEXT,
+            added_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            query TEXT,
+            title TEXT,
+            file_id TEXT,
+            played_at TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def add_user(user_id: int, username: str, first_name: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR IGNORE INTO users (user_id, username, first_name, joined_at)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, username, first_name, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def add_history(user_id: int, query: str, title: str, file_id: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO history (user_id, query, title, file_id, played_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (user_id, query, title, file_id, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def get_last_history_id(user_id: int) -> int:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id FROM history WHERE user_id = ?
+        ORDER BY id DESC LIMIT 1
+    """, (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def get_history_by_id(history_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT query, title, file_id FROM history WHERE id = ?
+    """, (history_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_history_by_file_id(user_id: int, file_id: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, query FROM history
+        WHERE user_id = ? AND file_id = ?
+        ORDER BY id DESC LIMIT 1
+    """, (user_id, file_id))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def add_like(user_id: int, query: str, title: str, file_id: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id FROM likes WHERE user_id = ? AND file_id = ?
+    """, (user_id, file_id))
+    existing = cur.fetchone()
+
+    if existing:
+        conn.close()
+        return False
+
+    cur.execute("""
+        INSERT INTO likes (user_id, query, title, file_id, added_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (user_id, query, title, file_id, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def remove_like(user_id: int, file_id: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        DELETE FROM likes WHERE user_id = ? AND file_id = ?
+    """, (user_id, file_id))
+    conn.commit()
+    conn.close()
+
+
+def remove_like_by_id(like_id: int, user_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        DELETE FROM likes WHERE id = ? AND user_id = ?
+    """, (like_id, user_id))
+    deleted = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def get_likes(user_id: int, limit: int = 20):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT query, title, file_id FROM likes
+        WHERE user_id = ?
+        ORDER BY added_at DESC
+        LIMIT ?
+    """, (user_id, limit))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_likes_with_id(user_id: int, limit: int = 20):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, query, title, file_id FROM likes
+        WHERE user_id = ?
+        ORDER BY added_at DESC
+        LIMIT ?
+    """, (user_id, limit))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_like_by_id(like_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT user_id, query, title, file_id FROM likes WHERE id = ?
+    """, (like_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_history(user_id: int, limit: int = 20):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT query, title, file_id FROM history
+        WHERE user_id = ?
+        ORDER BY played_at DESC
+        LIMIT ?
+    """, (user_id, limit))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def is_liked(user_id: int, file_id: str) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id FROM likes WHERE user_id = ? AND file_id = ?
+    """, (user_id, file_id))
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
