@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import uuid
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -287,6 +288,23 @@ async def cb_similar(call: types.CallbackQuery):
     await call.message.answer("🔍 Просто напиши новый запрос — найду похожее.")
 
 
+async def handle_ping(request):
+    """Фейковый обработчик для Render — чтобы он думал, что это веб-сервис."""
+    return web.Response(text="Bot is alive")
+
+
+async def start_web_server():
+    """Запускает фейковый веб-сервер на порту, который требует Render."""
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"[web] фейковый сервер на порту {port}")
+
+
 async def main():
     commands = [
         BotCommand(command="start", description="🚀 Запустить бота"),
@@ -297,7 +315,11 @@ async def main():
     await bot.set_my_commands(commands)
 
     print("Бот запущен...")
-    await dp.start_polling(bot)
+    # Запускаем фейковый веб-сервер и бота параллельно
+    await asyncio.gather(
+        start_web_server(),
+        dp.start_polling(bot),
+    )
 
 
 if __name__ == "__main__":
