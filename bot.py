@@ -6,7 +6,13 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import BotCommand
+from aiogram.types import (
+    BotCommand,
+    LabeledPrice,
+    PreCheckoutQuery,
+    Message,
+    CallbackQuery,
+)
 
 from config import BOT_TOKEN
 import database as db
@@ -30,6 +36,14 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 db.init_db()
 
+# Суммы донатов (в звёздах)
+DONATE_AMOUNTS = [10, 50, 100, 500, 1000]
+
+# Хранилище: кто сейчас вводит свою сумму
+awaiting_custom_amount = set()
+
+
+# ============ ОСНОВНЫЕ КОМАНДЫ ============
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -46,6 +60,7 @@ async def cmd_start(message: types.Message):
         f"📋 Команды:\n"
         f"/likes — твои лайки\n"
         f"/history — что слушал\n"
+        f"/donate — поддержать проект ⭐\n"
         f"/help — помощь"
     )
     await message.answer(text)
@@ -62,11 +77,126 @@ async def cmd_help(message: types.Message):
         f"/start — запуск\n"
         f"/likes — избранное\n"
         f"/history — история\n"
+        f"/donate — поддержать проект ⭐\n"
         f"/help — эта справка\n\n"
         f"_Бот создан PufenshuyVV_"
     )
     await message.answer(text, parse_mode="Markdown")
 
+
+# ============ ДОНАТЫ ЧЕРЕЗ TELEGRAM STARS ============
+
+def donate_keyboard():
+    builder = InlineKeyboardBuilder()
+    for amount in DONATE_AMOUNTS:
+        builder.button(
+            text=f"⭐ {amount}",
+            callback_data=f"donate:{amount}"
+        )
+    builder.button(text="✏️ Своя сумма", callback_data="donate:custom")
+    builder.adjust(3, 2, 1)
+    return builder.as_markup()
+
+
+@dp.message(Command("donate"))
+async def cmd_donate(message: types.Message):
+    text = (
+        f"⭐ *Поддержать проект*\n\n"
+        f"Если бот тебе полезен — можешь поддержать его звёздами Telegram.\n"
+        f"Это помогает развивать бота и добавлять новые функции.\n\n"
+        f"Выбери сумму или введи свою:"
+    )
+    await message.answer(text, parse_mode="Markdown", reply_markup=donate_keyboard())
+
+
+@dp.callback_query(F.data.startswith("donate:"))
+async def cb_donate(call: CallbackQuery):
+    _, value = call.data.split(":", 1)
+
+    if value == "custom":
+        awaiting_custom_amount.add(call.from_user.id)
+        await call.answer()
+        await call.message.answer(
+            "✏️ Напиши сумму в звёздах (целое число от 1 до 100000).\n\n"
+            "Например: `777`"
+        )
+        return
+
+    try:
+        amount = int(value)
+    except ValueError:
+        await call.answer("Неверная сумма")
+        return
+
+    await call.answer()
+    await send_stars_invoice(call.message.chat.id, amount)
+
+
+async def send_stars_invoice(chat_id: int, amount: int):
+    try:
+        await bot.send_invoice(
+            chat_id=chat_id,
+            title="Поддержка бота ⭐",
+            description=f"Донат {amount} звёзд на развитие музыкального бота",
+            payload=f"donate_{amount}_{chat_id}",
+            provider_token="",
+            currency="XTR",
+            prices=[LabeledPrice(label="Донат", amount=amount)],
+            start_parameter="donate",
+        )
+    except Exception as e:
+        logging.exception("Ошибка send_invoice")
+        await bot.send_message(chat_id, f"⚠️ Не удалось создать платёж: {e}")
+
+
+@dp.message(F.text, lambda m: m.from_user.id in awaiting_custom_amount)
+async def handle_custom_amount(message: types.Message):
+    text = message.text.strip()
+
+    if not text.isdigit():
+        await message.answer("⚠️ Напиши целое число, например `777`")
+        return
+
+    amount = int(text)
+    if amount < 1 or amount > 100000:
+        await message.answer("⚠️ Сумма должна быть от 1 до 100000 звёзд.")
+        return
+
+    awaiting_custom_amount.discard(message.from_user.id)
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text=f"⭐ Донат {amount}", callback_data=f"donate:{amount}")
+    await message.answer(
+        f"Твоя сумма: *{amount}* звёзд.\nЖми кнопку для оплаты:",
+        parse_mode="Markdown",
+        reply_markup=builder.as_markup()
+    )
+
+
+@dp.pre_checkout_query()
+async def pre_checkout(query: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(query.id, ok=True)
+
+
+@dp.message(F.successful_payment)
+async def on_successful_payment(message: types.Message):
+    stars = message.successful_payment.total_amount
+    db.add_user(
+        message.from_user.id,
+        message.from_user.username or "",
+        message.from_user.first_name or ""
+    )
+    await message.answer(
+        f"🎉 *Спасибо за поддержку!*\n\n"
+        f"Ты отправил(а) ⭐ *{stars}* звёзд.\n"
+        f"Это помогает развивать бота — спасибо!\n\n"
+        f"_— PufenshuyVV_",
+        parse_mode="Markdown"
+    )
+    logging.info(f"Донат {stars} звёзд от user_id={message.from_user.id}")
+
+
+# ============ ИСТОРИЯ / ЛАЙКИ ============
 
 @dp.message(Command("likes"))
 async def cmd_likes(message: types.Message):
@@ -123,6 +253,8 @@ async def cmd_history(message: types.Message):
             logging.warning(f"Не отправил из истории {file_id}: {e}")
 
 
+# ============ ПОИСК МУЗЫКИ ============
+
 def build_track_keyboard(history_id: int, liked: bool = False):
     builder = InlineKeyboardBuilder()
     if liked:
@@ -151,7 +283,6 @@ async def search_music(message: types.Message):
 
 
 async def do_search(message: types.Message, query: str):
-    """Универсальная функция поиска — используется и в поиске, и в повторе."""
     status = await message.answer(f"🔍 Ищу: *{query}*...", parse_mode="Markdown")
 
     file_id = str(uuid.uuid4())
@@ -288,13 +419,13 @@ async def cb_similar(call: types.CallbackQuery):
     await call.message.answer("🔍 Просто напиши новый запрос — найду похожее.")
 
 
+# ============ ФЕЙКОВЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ============
+
 async def handle_ping(request):
-    """Фейковый обработчик для Render — чтобы он думал, что это веб-сервис."""
     return web.Response(text="Bot is alive")
 
 
 async def start_web_server():
-    """Запускает фейковый веб-сервер на порту, который требует Render."""
     app = web.Application()
     app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app)
@@ -305,17 +436,19 @@ async def start_web_server():
     print(f"[web] фейковый сервер на порту {port}")
 
 
+# ============ MAIN ============
+
 async def main():
     commands = [
         BotCommand(command="start", description="🚀 Запустить бота"),
         BotCommand(command="likes", description="❤️ Мои лайки"),
         BotCommand(command="history", description="🕐 История"),
+        BotCommand(command="donate", description="⭐ Поддержать проект"),
         BotCommand(command="help", description="❓ Помощь"),
     ]
     await bot.set_my_commands(commands)
 
     print("Бот запущен...")
-    # Запускаем фейковый веб-сервер и бота параллельно
     await asyncio.gather(
         start_web_server(),
         dp.start_polling(bot),

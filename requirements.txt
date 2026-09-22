@@ -1,4 +1,4 @@
-aiogram
+aiogram>=3.15
 yt-dlp
 python-dotenv
 static-ffmpeg
