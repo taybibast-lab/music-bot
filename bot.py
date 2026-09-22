@@ -10,6 +10,15 @@ from aiogram.types import BotCommand
 from config import BOT_TOKEN
 import database as db
 
+# === FFMPEG для Render (static-ffmpeg) ===
+try:
+    from static_ffmpeg import run as _ffmpeg_run
+    _ffmpeg_path, _ffprobe_path = _ffmpeg_run.get_or_fetch_platform_executables_else_raise()
+    os.environ["PATH"] = os.path.dirname(_ffmpeg_path) + os.pathsep + os.environ.get("PATH", "")
+    print(f"[ffmpeg] path: {_ffmpeg_path}")
+except Exception as _e:
+    print(f"[ffmpeg] не удалось загрузить static-ffmpeg: {_e}")
+
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN)
@@ -169,7 +178,7 @@ async def do_search(message: types.Message, query: str):
 
         if process.returncode != 0:
             await status.edit_text("❌ Не нашёл трек.\n\nПопробуй другой запрос.")
-            logging.error(f"yt-dlp error: {stderr.decode(errors='ignore')[-300:]}")
+            logging.error(f"yt-dlp error: {stderr.decode(errors='ignore')[-500:]}")
             return
 
         mp3_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp3")
