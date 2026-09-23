@@ -2,6 +2,9 @@ import asyncio
 import logging
 import os
 import uuid
+import time
+import random
+from collections import defaultdict
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -30,6 +33,108 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 db.init_db()
 
+
+# ============ НАСТРОЙКИ АДМИНА ============
+ADMIN_ID = 8933557359
+ADMIN_USERNAME = "puffvsv"
+
+
+def is_admin(user) -> bool:
+    """Проверка: админ ли это."""
+    if user.id == ADMIN_ID:
+        return True
+    if (user.username or "").lower() == ADMIN_USERNAME.lower():
+        return True
+    return False
+
+
+# ============ АНТИСПАМ: НАСТРОЙКИ ============
+SPAM_LIMIT = 15                # макс сообщений за окно
+SPAM_WINDOW = 3                # окно (сек) для флуда
+BOT_INTERVAL_WINDOW = 10       # окно для детекта бота (сек)
+BOT_INTERVAL_COUNT = 5         # сколько «идеальных» интервалов подряд
+BOT_INTERVAL_TOLERANCE = 0.010 # 10 мс — разброс
+MAX_CAPTCHA_TRIES = 3
+OLD_MESSAGE_AGE = 30           # если сообщение старше 30 сек — игнор
+BOT_WARMUP_TIME = 30           # первые 30 сек после старта — не банят
+
+
+# ============ АНТИСПАМ: ПАМЯТЬ ============
+banned_users = set()               # ID забаненных (для быстрой проверки)
+captcha_state = {}                 # user_id -> {"answer": int, "tries": int}
+user_tracker = defaultdict(list)   # user_id -> [timestamps]
+bot_start_time = time.time()       # время старта бота
+
+
+# ============ АНТИСПАМ: ЛОГИКА ============
+
+def load_banned():
+    """Загрузить список банов из базы в память (при старте)."""
+    global banned_users
+    banned_users = set(db.load_all_banned())
+    print(f"[ban] загружено {len(banned_users)} забаненных")
+
+
+def is_banned_fast(user_id: int) -> bool:
+    """Быстрая проверка бана (по памяти, без SQL)."""
+    return user_id in banned_users
+
+
+def is_spamming(user_id: int, msg_time: float) -> bool:
+    """
+    Проверка на спам.
+    Возвращает True, если похоже на спам.
+    """
+    now = msg_time  # используем время сообщения, а не получения
+
+    # Оставляем только сообщения за последние BOT_INTERVAL_WINDOW секунд
+    user_tracker[user_id] = [
+        t for t in user_tracker[user_id]
+        if now - t < BOT_INTERVAL_WINDOW
+    ]
+    user_tracker[user_id].append(now)
+
+    timestamps = user_tracker[user_id]
+
+    # === Проверка А: флуд (много за короткое время) ===
+    recent = [t for t in timestamps if now - t < SPAM_WINDOW]
+    if len(recent) > SPAM_LIMIT:
+        return True
+
+    # === Проверка Б: идеальные интервалы (бот) ===
+    if len(timestamps) >= BOT_INTERVAL_COUNT + 1:
+        intervals = [
+            timestamps[i + 1] - timestamps[i]
+            for i in range(len(timestamps) - 1)
+        ]
+        last_n = intervals[-BOT_INTERVAL_COUNT:]
+        # Если все интервалы почти одинаковые → бот
+        if max(last_n) - min(last_n) < BOT_INTERVAL_TOLERANCE:
+            return True
+
+    return False
+
+
+def is_old_message(msg_date) -> bool:
+    """Сообщение старше OLD_MESSAGE_AGE секунд (из очереди Render)."""
+    try:
+        msg_time = msg_date.timestamp()
+        return (time.time() - msg_time) > OLD_MESSAGE_AGE
+    except Exception:
+        return False
+
+
+def bot_is_warming_up() -> bool:
+    """Первые BOT_WARMUP_TIME секунд после старта — не баним."""
+    return (time.time() - bot_start_time) < BOT_WARMUP_TIME
+
+
+def reset_user_tracker(user_id: int):
+    """Сброс счётчика сообщений (после успешной капчи)."""
+    user_tracker[user_id] = []
+
+
+# ============ START / HELP ============
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -134,7 +239,7 @@ async def process_successful_payment(message: types.Message):
     )
 
 
-# ============ LIKES ============
+# ============ LIKES / HISTORY ============
 
 @dp.message(Command("likes"))
 async def cmd_likes(message: types.Message):
@@ -201,7 +306,7 @@ def build_track_keyboard(history_id: int, liked: bool = False):
     return builder.as_markup()
 
 
-# ============ SEARCH ============
+# ============ SEARCH (пока БЕЗ антиспама) ============
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def search_music(message: types.Message):
@@ -359,7 +464,7 @@ async def cb_similar(call: types.CallbackQuery):
     await call.message.answer("🔍 Просто напиши новый запрос — найду похожее.")
 
 
-# ============ WEB SERVER (для пингов, чтобы Render не спал) ============
+# ============ WEB SERVER (для пингов) ============
 
 async def start_web_server():
     async def handle(request):
@@ -369,7 +474,6 @@ async def start_web_server():
     app.router.add_get("/", handle)
     app.router.add_get("/ping", handle)
 
-    # Render даёт порт через переменную окружения PORT
     port = int(os.environ.get("PORT", 8080))
 
     runner = web.AppRunner(app)
@@ -382,6 +486,9 @@ async def start_web_server():
 # ============ MAIN ============
 
 async def main():
+    # Загружаем баны из базы в память
+    load_banned()
+
     # Запускаем веб-сервер в фоне
     asyncio.create_task(start_web_server())
 
