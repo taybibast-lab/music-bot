@@ -40,7 +40,6 @@ ADMIN_USERNAME = "puffvsv"
 
 
 def is_admin(user) -> bool:
-    """Проверка: админ ли это."""
     if user.id == ADMIN_ID:
         return True
     if (user.username or "").lower() == ADMIN_USERNAME.lower():
@@ -49,66 +48,56 @@ def is_admin(user) -> bool:
 
 
 # ============ АНТИСПАМ: НАСТРОЙКИ ============
-SPAM_LIMIT = 15                # макс сообщений за окно
-SPAM_WINDOW = 3                # окно (сек) для флуда
-BOT_INTERVAL_WINDOW = 10       # окно для детекта бота (сек)
-BOT_INTERVAL_COUNT = 5         # сколько «идеальных» интервалов подряд
-BOT_INTERVAL_TOLERANCE = 0.010 # 10 мс — разброс
+SPAM_LIMIT = 15
+SPAM_WINDOW = 3
+BOT_INTERVAL_WINDOW = 10
+BOT_INTERVAL_COUNT = 5
+BOT_INTERVAL_TOLERANCE = 0.010
 MAX_CAPTCHA_TRIES = 3
-OLD_MESSAGE_AGE = 30           # если сообщение старше 30 сек — игнор
-BOT_WARMUP_TIME = 30           # первые 30 сек после старта — не банят
+OLD_MESSAGE_AGE = 30
+BOT_WARMUP_TIME = 30
 
 
 # ============ АНТИСПАМ: ПАМЯТЬ ============
-banned_users = set()               # ID забаненных (для быстрой проверки)
+banned_users = set()
 captcha_state = {}                 # user_id -> {"answer": int, "tries": int}
 user_tracker = defaultdict(list)   # user_id -> [timestamps]
-bot_start_time = time.time()       # время старта бота
+bot_start_time = time.time()
 
 
 # ============ АНТИСПАМ: ЛОГИКА ============
 
 def load_banned():
-    """Загрузить список банов из базы в память (при старте)."""
     global banned_users
     banned_users = set(db.load_all_banned())
     print(f"[ban] загружено {len(banned_users)} забаненных")
 
 
 def is_banned_fast(user_id: int) -> bool:
-    """Быстрая проверка бана (по памяти, без SQL)."""
     return user_id in banned_users
 
 
 def is_spamming(user_id: int, msg_time: float) -> bool:
-    """
-    Проверка на спам.
-    Возвращает True, если похоже на спам.
-    """
-    now = msg_time  # используем время сообщения, а не получения
-
-    # Оставляем только сообщения за последние BOT_INTERVAL_WINDOW секунд
+    now = msg_time
     user_tracker[user_id] = [
         t for t in user_tracker[user_id]
         if now - t < BOT_INTERVAL_WINDOW
     ]
     user_tracker[user_id].append(now)
-
     timestamps = user_tracker[user_id]
 
-    # === Проверка А: флуд (много за короткое время) ===
+    # Проверка А: флуд
     recent = [t for t in timestamps if now - t < SPAM_WINDOW]
     if len(recent) > SPAM_LIMIT:
         return True
 
-    # === Проверка Б: идеальные интервалы (бот) ===
+    # Проверка Б: идеальные интервалы (бот)
     if len(timestamps) >= BOT_INTERVAL_COUNT + 1:
         intervals = [
             timestamps[i + 1] - timestamps[i]
             for i in range(len(timestamps) - 1)
         ]
         last_n = intervals[-BOT_INTERVAL_COUNT:]
-        # Если все интервалы почти одинаковые → бот
         if max(last_n) - min(last_n) < BOT_INTERVAL_TOLERANCE:
             return True
 
@@ -116,7 +105,6 @@ def is_spamming(user_id: int, msg_time: float) -> bool:
 
 
 def is_old_message(msg_date) -> bool:
-    """Сообщение старше OLD_MESSAGE_AGE секунд (из очереди Render)."""
     try:
         msg_time = msg_date.timestamp()
         return (time.time() - msg_time) > OLD_MESSAGE_AGE
@@ -125,19 +113,94 @@ def is_old_message(msg_date) -> bool:
 
 
 def bot_is_warming_up() -> bool:
-    """Первые BOT_WARMUP_TIME секунд после старта — не баним."""
     return (time.time() - bot_start_time) < BOT_WARMUP_TIME
 
 
 def reset_user_tracker(user_id: int):
-    """Сброс счётчика сообщений (после успешной капчи)."""
     user_tracker[user_id] = []
+
+
+def ban_user(user_id: int, reason: str = "spam"):
+    """Забанить юзера (и в базу, и в память)."""
+    db.add_banned(user_id, reason)
+    banned_users.add(user_id)
+    captcha_state.pop(user_id, None)
+    logging.info(f"[ban] user_id={user_id} reason={reason}")
+
+
+# ============ КАПЧА ============
+
+async def send_captcha(message: types.Message):
+    """Отправить капчу юзеру."""
+    user_id = message.from_user.id
+    a = random.randint(2, 9)
+    b = random.randint(2, 9)
+    answer = a + b
+
+    tries = captcha_state.get(user_id, {}).get("tries", 0)
+    captcha_state[user_id] = {"answer": answer, "tries": tries}
+
+    await message.answer(
+        f"🤖 *Антиспам-проверка*\n\n"
+        f"Ты пишешь слишком быстро. Подтверди, что ты человек.\n\n"
+        f"Сколько будет *{a} + {b}*?\n\n"
+        f"Напиши ответ цифрой.\n"
+        f"Осталось попыток: *{MAX_CAPTCHA_TRIES - tries}*",
+        parse_mode="Markdown"
+    )
+
+
+async def handle_captcha_answer(message: types.Message) -> bool:
+    """
+    Обработать ответ на капчу.
+    Возвращает True, если сообщение было ответом на капчу.
+    """
+    user_id = message.from_user.id
+
+    if user_id not in captcha_state:
+        return False
+
+    state = captcha_state[user_id]
+
+    # Пытаемся распарсить число
+    try:
+        answer = int(message.text.strip())
+    except ValueError:
+        await message.answer("⚠️ Напиши ответ цифрой.")
+        return True
+
+    if answer == state["answer"]:
+        # Правильно
+        captcha_state.pop(user_id, None)
+        reset_user_tracker(user_id)
+        await message.answer("✅ Проверка пройдена. Пиши дальше.")
+        return True
+    else:
+        # Неправильно
+        state["tries"] += 1
+
+        if state["tries"] >= MAX_CAPTCHA_TRIES:
+            ban_user(user_id, "captcha_failed")
+            await message.answer(
+                "🚫 Ты не прошёл проверку. Доступ заблокирован."
+            )
+            captcha_state.pop(user_id, None)
+        else:
+            remaining = MAX_CAPTCHA_TRIES - state["tries"]
+            await message.answer(
+                f"❌ Неправильно. Осталось попыток: *{remaining}*",
+                parse_mode="Markdown"
+            )
+        return True
 
 
 # ============ START / HELP ============
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
+    if is_banned_fast(message.from_user.id):
+        return
+
     db.add_user(
         message.from_user.id,
         message.from_user.username or "",
@@ -159,6 +222,9 @@ async def cmd_start(message: types.Message):
 
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
+    if is_banned_fast(message.from_user.id):
+        return
+
     text = (
         f"🤖 *Как пользоваться ботом:*\n\n"
         f"1. Напиши название трека или исполнителя\n"
@@ -182,6 +248,9 @@ DONATE_AMOUNTS = [10, 50, 100, 500, 1000, 5000, 10000]
 
 @dp.message(Command("donate"))
 async def cmd_donate(message: types.Message):
+    if is_banned_fast(message.from_user.id):
+        return
+
     builder = InlineKeyboardBuilder()
     for amount in DONATE_AMOUNTS:
         builder.button(text=f"⭐ {amount}", callback_data=f"donate:{amount}")
@@ -199,6 +268,9 @@ async def cmd_donate(message: types.Message):
 
 @dp.callback_query(F.data.startswith("donate:"))
 async def cb_donate(call: types.CallbackQuery):
+    if is_banned_fast(call.from_user.id):
+        return
+
     amount = int(call.data.split(":", 1)[1])
 
     if amount < 10 or amount > 10000:
@@ -243,6 +315,9 @@ async def process_successful_payment(message: types.Message):
 
 @dp.message(Command("likes"))
 async def cmd_likes(message: types.Message):
+    if is_banned_fast(message.from_user.id):
+        return
+
     likes = db.get_likes_with_id(message.from_user.id, limit=20)
     if not likes:
         await message.answer("У тебя пока нет лайков. Нажми ❤️ под треком.")
@@ -268,6 +343,9 @@ async def cmd_likes(message: types.Message):
 
 @dp.message(Command("history"))
 async def cmd_history(message: types.Message):
+    if is_banned_fast(message.from_user.id):
+        return
+
     history = db.get_history(message.from_user.id, limit=10)
     if not history:
         await message.answer("Ты ещё ничего не слушал.")
@@ -306,18 +384,47 @@ def build_track_keyboard(history_id: int, liked: bool = False):
     return builder.as_markup()
 
 
-# ============ SEARCH (пока БЕЗ антиспама) ============
+# ============ SEARCH (с антиспамом!) ============
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def search_music(message: types.Message):
-    query = message.text.strip()
+    user_id = message.from_user.id
 
+    # 1. Старое сообщение (из очереди Render) — игнор
+    if is_old_message(message.date):
+        return
+
+    # 2. Бан (мгновенно, без SQL)
+    if is_banned_fast(user_id):
+        return
+
+    # 3. Капча активна? → обработка ответа
+    if await handle_captcha_answer(message):
+        return
+
+    # 4. Прогрев бота (первые 30 сек) — не баним
+    if not bot_is_warming_up():
+        # 5. Спам? → капча
+        msg_time = message.date.timestamp()
+        if is_spamming(user_id, msg_time):
+            # Админ — пасхалка
+            if is_admin(message.from_user):
+                await message.answer(
+                    "Господин, будь вы ботом — мы бы вас забанили 😏\n\n"
+                    "Но вы — не бот. Хотите решить капчу для интереса?"
+                )
+                return
+            await send_captcha(message)
+            return
+
+    # 6. Обычный поиск
+    query = message.text.strip()
     if not query:
         await message.answer("Напиши что искать 🤔")
         return
 
     db.add_user(
-        message.from_user.id,
+        user_id,
         message.from_user.username or "",
         message.from_user.first_name or ""
     )
@@ -400,6 +507,9 @@ async def do_search(message: types.Message, query: str):
 
 @dp.callback_query(F.data.startswith("like:"))
 async def cb_like(call: types.CallbackQuery):
+    if is_banned_fast(call.from_user.id):
+        return
+
     _, history_id = call.data.split(":", 1)
     row = db.get_history_by_id(int(history_id))
 
@@ -430,6 +540,9 @@ async def cb_nolike(call: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("unlike:"))
 async def cb_unlike(call: types.CallbackQuery):
+    if is_banned_fast(call.from_user.id):
+        return
+
     _, like_id = call.data.split(":", 1)
     deleted = db.remove_like_by_id(int(like_id), call.from_user.id)
 
@@ -445,6 +558,9 @@ async def cb_unlike(call: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("repeat:"))
 async def cb_repeat(call: types.CallbackQuery):
+    if is_banned_fast(call.from_user.id):
+        return
+
     _, history_id = call.data.split(":", 1)
     row = db.get_history_by_id(int(history_id))
 
@@ -464,7 +580,7 @@ async def cb_similar(call: types.CallbackQuery):
     await call.message.answer("🔍 Просто напиши новый запрос — найду похожее.")
 
 
-# ============ WEB SERVER (для пингов) ============
+# ============ WEB SERVER ============
 
 async def start_web_server():
     async def handle(request):
@@ -486,10 +602,7 @@ async def start_web_server():
 # ============ MAIN ============
 
 async def main():
-    # Загружаем баны из базы в память
     load_banned()
-
-    # Запускаем веб-сервер в фоне
     asyncio.create_task(start_web_server())
 
     commands = [
