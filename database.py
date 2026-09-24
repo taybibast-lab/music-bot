@@ -5,7 +5,6 @@ DB_PATH = "music_bot.db"
 
 
 def init_db():
-    """Создаёт таблицы, если их нет."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
@@ -40,7 +39,6 @@ def init_db():
         )
     """)
 
-    # НОВАЯ таблица — забаненные
     cur.execute("""
         CREATE TABLE IF NOT EXISTS banned (
             user_id INTEGER PRIMARY KEY,
@@ -48,6 +46,22 @@ def init_db():
             banned_at TEXT
         )
     """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tracks (
+            query TEXT PRIMARY KEY,
+            title TEXT,
+            artist TEXT,
+            file_id TEXT,
+            cached_at TEXT
+        )
+    """)
+
+    # Миграция старой БД — добавить artist если нет
+    try:
+        cur.execute("ALTER TABLE tracks ADD COLUMN artist TEXT")
+    except sqlite3.OperationalError:
+        pass
 
     conn.commit()
     conn.close()
@@ -66,10 +80,44 @@ def add_user(user_id: int, username: str, first_name: str):
     conn.close()
 
 
+# ============ CACHE ============
+
+def get_cached_track(query: str):
+    """(title, artist, file_id) или None."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT title, artist, file_id FROM tracks WHERE query = ?",
+        (query.lower().strip(),)
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def cache_track(query: str, title: str, artist: str, file_id: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO tracks (query, title, artist, file_id, cached_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (query.lower().strip(), title, artist or "Music Bot", file_id, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def delete_cached_track(query: str):
+    """Удалить трек из кэша (если file_id протух)."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tracks WHERE query = ?", (query.lower().strip(),))
+    conn.commit()
+    conn.close()
+
+
 # ============ BANNED ============
 
 def add_banned(user_id: int, reason: str = "spam"):
-    """Добавить юзера в бан."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
@@ -81,7 +129,6 @@ def add_banned(user_id: int, reason: str = "spam"):
 
 
 def is_banned(user_id: int) -> bool:
-    """Проверить, забанен ли юзер (в базе)."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT user_id FROM banned WHERE user_id = ?", (user_id,))
@@ -91,7 +138,6 @@ def is_banned(user_id: int) -> bool:
 
 
 def remove_ban(user_id: int) -> bool:
-    """Разбанить юзера."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("DELETE FROM banned WHERE user_id = ?", (user_id,))
@@ -102,7 +148,6 @@ def remove_ban(user_id: int) -> bool:
 
 
 def load_all_banned():
-    """Загрузить все ID забаненных в список (для памяти)."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT user_id FROM banned")
@@ -139,9 +184,7 @@ def get_last_history_id(user_id: int) -> int:
 def get_history_by_id(history_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("""
-        SELECT query, title, file_id FROM history WHERE id = ?
-    """, (history_id,))
+    cur.execute("SELECT query, title, file_id FROM history WHERE id = ?", (history_id,))
     row = cur.fetchone()
     conn.close()
     return row
@@ -179,12 +222,8 @@ def get_history(user_id: int, limit: int = 20):
 def add_like(user_id: int, query: str, title: str, file_id: str):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("""
-        SELECT id FROM likes WHERE user_id = ? AND file_id = ?
-    """, (user_id, file_id))
-    existing = cur.fetchone()
-
-    if existing:
+    cur.execute("SELECT id FROM likes WHERE user_id = ? AND file_id = ?", (user_id, file_id))
+    if cur.fetchone():
         conn.close()
         return False
 
@@ -200,9 +239,7 @@ def add_like(user_id: int, query: str, title: str, file_id: str):
 def remove_like(user_id: int, file_id: str):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("""
-        DELETE FROM likes WHERE user_id = ? AND file_id = ?
-    """, (user_id, file_id))
+    cur.execute("DELETE FROM likes WHERE user_id = ? AND file_id = ?", (user_id, file_id))
     conn.commit()
     conn.close()
 
@@ -210,9 +247,7 @@ def remove_like(user_id: int, file_id: str):
 def remove_like_by_id(like_id: int, user_id: int) -> bool:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("""
-        DELETE FROM likes WHERE id = ? AND user_id = ?
-    """, (like_id, user_id))
+    cur.execute("DELETE FROM likes WHERE id = ? AND user_id = ?", (like_id, user_id))
     deleted = cur.rowcount > 0
     conn.commit()
     conn.close()
@@ -250,9 +285,7 @@ def get_likes_with_id(user_id: int, limit: int = 20):
 def get_like_by_id(like_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("""
-        SELECT user_id, query, title, file_id FROM likes WHERE id = ?
-    """, (like_id,))
+    cur.execute("SELECT user_id, query, title, file_id FROM likes WHERE id = ?", (like_id,))
     row = cur.fetchone()
     conn.close()
     return row
@@ -261,9 +294,7 @@ def get_like_by_id(like_id: int):
 def is_liked(user_id: int, file_id: str) -> bool:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("""
-        SELECT id FROM likes WHERE user_id = ? AND file_id = ?
-    """, (user_id, file_id))
+    cur.execute("SELECT id FROM likes WHERE user_id = ? AND file_id = ?", (user_id, file_id))
     row = cur.fetchone()
     conn.close()
     return row is not None

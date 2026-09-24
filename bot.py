@@ -128,8 +128,7 @@ def is_spamming(user_id: int, msg_time: float) -> bool:
 
 def is_old_message(msg_date) -> bool:
     try:
-        msg_time = msg_date.timestamp()
-        return (time.time() - msg_time) > OLD_MESSAGE_AGE
+        return (time.time() - msg_date.timestamp()) > OLD_MESSAGE_AGE
     except Exception:
         return False
 
@@ -220,6 +219,7 @@ async def cmd_start(message: types.Message):
         f"Просто напиши название трека или исполнителя — "
         f"я найду и пришлю тебе музыку прямо в Telegram.\n\n"
         f"📋 Команды:\n"
+        f"/search — 🔍 найти трек\n"
         f"/likes — твои лайки\n"
         f"/history — что слушал\n"
         f"/wave — 🌊 случайный трек\n"
@@ -242,6 +242,7 @@ async def cmd_help(message: types.Message):
         f"3. Жми ❤️ чтобы добавить трек в избранное\n\n"
         f"*Команды:*\n"
         f"/start — запуск\n"
+        f"/search [трек] — 🔍 найти трек\n"
         f"/likes — избранное\n"
         f"/history — история\n"
         f"/wave — 🌊 случайный трек\n"
@@ -251,6 +252,38 @@ async def cmd_help(message: types.Message):
         f"_Бот создан PufenshuyVV_"
     )
     await message.answer(text, parse_mode="Markdown")
+
+
+# ============ /SEARCH ============
+
+@dp.message(Command("search"))
+async def cmd_search(message: types.Message):
+    if is_banned_fast(message.from_user.id):
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer(
+            "🔍 *Поиск трека*\n\n"
+            "Напиши: `/search название`\n"
+            "Например: `/search Кизару`",
+            parse_mode="Markdown"
+        )
+        return
+
+    query = args[1].strip()
+    if not query:
+        await message.answer("Напиши что искать 🤔")
+        return
+
+    db.add_user(
+        message.from_user.id,
+        message.from_user.username or "",
+        message.from_user.first_name or ""
+    )
+
+    logging.info(f"[/search] user={message.from_user.id} query={query}")
+    await do_search(message, query)
 
 
 # ============ ВОЛНА ============
@@ -293,7 +326,7 @@ async def do_album_search(message: types.Message, album_name: str):
     os.makedirs(tmp_dir, exist_ok=True)
 
     try:
-        # === ШАГ 1: получаем URL'ы треков (быстро) ===
+        # === ШАГ 1: получаем URL'ы треков ===
         info_cmd = [
             "yt-dlp",
             f"scsearch:{album_name}",
@@ -305,12 +338,14 @@ async def do_album_search(message: types.Message, album_name: str):
             "-q",
         ]
 
+        logging.info(f"[album] ищу: {album_name}")
         proc = await asyncio.create_subprocess_exec(
             *info_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await proc.communicate()
+        logging.info(f"[album] url search rc={proc.returncode}")
 
         tracks = []
         for line in stdout.decode(errors="ignore").strip().split("\n"):
@@ -323,6 +358,7 @@ async def do_album_search(message: types.Message, album_name: str):
                     tracks.append((url, title))
 
         if not tracks:
+            logging.warning(f"[album] no tracks found, stderr={stderr.decode(errors='ignore')[-300:]}")
             await status.edit_text(
                 "❌ *Альбом не найден.*\n\nПопробуй точное название.",
                 parse_mode="Markdown"
@@ -331,12 +367,12 @@ async def do_album_search(message: types.Message, album_name: str):
             return
 
         await status.edit_text(
-            f"📀 *Найдено {len(tracks)} треков. Качаю...*",
+            f"📀 *Найдено {len(tracks)} треков. Качаю в 3 потока...*",
             parse_mode="Markdown"
         )
 
-        # === ШАГ 2: параллельное скачивание (2 одновременно) ===
-        sem = asyncio.Semaphore(2)
+        # === ШАГ 2: параллельно 3 трека ===
+        sem = asyncio.Semaphore(3)
         sent_count = [0]
         print_fmt = "after_move:%(title)s\t%(uploader)s\t%(filepath)s"
 
@@ -358,6 +394,8 @@ async def do_album_search(message: types.Message, album_name: str):
                     "-q",
                     "--no-check-certificates",
                     "--socket-timeout", "15",
+                    "--retries", "2",
+                    "--concurrent-fragments", "4",
                 ]
 
                 try:
@@ -366,9 +404,8 @@ async def do_album_search(message: types.Message, album_name: str):
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
-                    out, _ = await p.communicate()
+                    out, err = await p.communicate()
 
-                    # Парсим метаданные
                     real_title = fallback_title[:80]
                     real_artist = "Music Bot"
                     mp3 = None
@@ -387,6 +424,7 @@ async def do_album_search(message: types.Message, album_name: str):
                         if not os.path.exists(mp3):
                             files = [f for f in os.listdir(tmp_dir) if f.startswith(track_id)]
                             if not files:
+                                logging.warning(f"[album] файл не найден для {fallback_title}")
                                 return
                             mp3 = os.path.join(tmp_dir, files[0])
 
@@ -407,7 +445,7 @@ async def do_album_search(message: types.Message, album_name: str):
                     except Exception:
                         pass
                 except Exception as e:
-                    logging.warning(f"Album track error {fallback_title}: {e}")
+                    logging.warning(f"[album] track error {fallback_title}: {e}")
 
         tasks = [download_and_send(url, title) for url, title in tracks]
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -419,6 +457,8 @@ async def do_album_search(message: types.Message, album_name: str):
 
         if sent_count[0] == 0:
             await message.answer("❌ Не удалось скачать ни одного трека.")
+        else:
+            logging.info(f"[album] отправлено {sent_count[0]} из {len(tracks)}")
 
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -562,7 +602,7 @@ def build_track_keyboard(history_id: int, liked: bool = False):
     return builder.as_markup()
 
 
-# ============ SEARCH ============
+# ============ SEARCH (текст) ============
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def search_music(message: types.Message):
@@ -598,6 +638,7 @@ async def search_music(message: types.Message):
         message.from_user.first_name or ""
     )
 
+    logging.info(f"[text] user={user_id} query={query}")
     await do_search(message, query)
 
 
@@ -621,7 +662,9 @@ async def do_search(message: types.Message, query: str):
             logging.info(f"[cache] hit: {query}")
             return
         except Exception as e:
-            logging.warning(f"[cache] miss: {e}")
+            # file_id протух — удаляем из кэша и ищем заново
+            logging.warning(f"[cache] invalid file_id, clearing: {e}")
+            db.delete_cached_track(query)
 
     status = await message.answer(f"🔍 Ищу: *{query}*...", parse_mode="Markdown")
 
@@ -644,6 +687,7 @@ async def do_search(message: types.Message, query: str):
         "-q",
         "--no-check-certificates",
         "--socket-timeout", "15",
+        "--retries", "2",
     ]
 
     try:
@@ -654,12 +698,17 @@ async def do_search(message: types.Message, query: str):
         )
         stdout, stderr = await process.communicate()
 
+        logging.info(f"[dl] query='{query}' rc={process.returncode}")
+
         if process.returncode != 0:
-            await status.edit_text("❌ Не нашёл трек.\n\nПопробуй другой запрос.")
-            logging.error(f"yt-dlp error: {stderr.decode(errors='ignore')[-500:]}")
+            err = stderr.decode(errors="ignore")
+            logging.error(f"[dl] error: {err[-500:]}")
+            await status.edit_text(
+                f"❌ Не нашёл трек.\n\n"
+                f"Попробуй другой запрос или напиши через /search"
+            )
             return
 
-        # === Парсим метаданные ===
         out = stdout.decode(errors="ignore")
         real_title = query[:60]
         real_artist = "Music Bot"
@@ -803,6 +852,7 @@ async def main():
 
     commands = [
         BotCommand(command="start", description="🚀 Запустить бота"),
+        BotCommand(command="search", description="🔍 Найти трек"),
         BotCommand(command="likes", description="❤️ Мои лайки"),
         BotCommand(command="history", description="🕐 История"),
         BotCommand(command="wave", description="🌊 Случайный трек"),
