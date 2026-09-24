@@ -65,7 +65,6 @@ def init_db():
         )
     """)
 
-    # Миграция старой БД
     try:
         cur.execute("ALTER TABLE tracks ADD COLUMN artist TEXT")
     except sqlite3.OperationalError:
@@ -74,8 +73,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-
-# ============ USERS ============
 
 def add_user(user_id: int, username: str, first_name: str):
     conn = sqlite3.connect(DB_PATH)
@@ -87,8 +84,6 @@ def add_user(user_id: int, username: str, first_name: str):
     conn.commit()
     conn.close()
 
-
-# ============ CACHE ============
 
 def get_cached_track(query: str):
     conn = sqlite3.connect(DB_PATH)
@@ -120,8 +115,6 @@ def delete_cached_track(query: str):
     conn.commit()
     conn.close()
 
-
-# ============ BANNED ============
 
 def add_banned(user_id: int, reason: str = "spam"):
     conn = sqlite3.connect(DB_PATH)
@@ -161,8 +154,6 @@ def load_all_banned():
     conn.close()
     return [row[0] for row in rows]
 
-
-# ============ HISTORY ============
 
 def add_history(user_id: int, query: str, title: str, file_id: str):
     conn = sqlite3.connect(DB_PATH)
@@ -223,8 +214,6 @@ def get_history(user_id: int, limit: int = 20):
     return rows
 
 
-# ============ LIKES ============
-
 def add_like(user_id: int, query: str, title: str, file_id: str):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -232,7 +221,6 @@ def add_like(user_id: int, query: str, title: str, file_id: str):
     if cur.fetchone():
         conn.close()
         return False
-
     cur.execute("""
         INSERT INTO likes (user_id, query, title, file_id, added_at)
         VALUES (?, ?, ?, ?, ?)
@@ -306,16 +294,12 @@ def is_liked(user_id: int, file_id: str) -> bool:
     return row is not None
 
 
-# ============ PREMIUM ============
-
 def add_premium(user_id: int, days: int = 30):
-    """Дать/продлить премиум на N дней."""
     now = datetime.now()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT until FROM premium WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
-
     if row and row[0] > now.isoformat():
         old_until = datetime.fromisoformat(row[0])
         new_until = (old_until + timedelta(days=days)).isoformat()
@@ -326,7 +310,6 @@ def add_premium(user_id: int, days: int = 30):
             INSERT OR REPLACE INTO premium (user_id, until, bought_at)
             VALUES (?, ?, ?)
         """, (user_id, new_until, now.isoformat()))
-
     conn.commit()
     conn.close()
 
@@ -354,8 +337,6 @@ def get_premium_until(user_id: int):
     return row[0] if row else None
 
 
-# ============ STATS (для админа) ============
-
 def get_total_users() -> int:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -366,7 +347,6 @@ def get_total_users() -> int:
 
 
 def get_users_today() -> int:
-    """Юзеры, которые зашли сегодня (по joined_at)."""
     today = datetime.now().strftime("%Y-%m-%d")
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -387,7 +367,6 @@ def get_tracks_today() -> int:
 
 
 def get_active_users_today() -> int:
-    """Юзеры, которые искали треки сегодня (уникальные)."""
     today = datetime.now().strftime("%Y-%m-%d")
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()

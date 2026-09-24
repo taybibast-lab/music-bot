@@ -7,7 +7,7 @@ import random
 import shutil
 from collections import defaultdict
 from datetime import datetime
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import BotCommand, LabeledPrice
@@ -40,12 +40,10 @@ db.init_db()
 ADMIN_ID = 8933557359
 ADMIN_USERNAME = "puffvsv"
 
-# Премиум для всех
-PREMIUM_STARS = 50           # 50 ⭐ за 30 дней
+PREMIUM_STARS = 50
 PREMIUM_DAYS = 30
-ADMIN_FREE_DAYS = 36500      # ~100 лет — по факту навсегда
+ADMIN_FREE_DAYS = 36500
 
-# Секретная команда админа
 ADMIN_SECRET_CMD = "CheckAdmin1121"
 
 
@@ -58,10 +56,90 @@ def is_admin(user) -> bool:
 
 
 def ensure_admin_premium(user):
-    """Выдать админу премиум, если ещё нет."""
     if is_admin(user) and not db.is_premium(user.id):
         db.add_premium(user.id, days=ADMIN_FREE_DAYS)
         logging.info(f"[premium] выдан админу {user.id}")
+
+
+# ============ ПРОВЕРКА ПОДПИСКИ ============
+CHANNEL_USERNAME = "@MusiclyLub"
+CHANNEL_URL = "https://t.me/MusiclyLub"
+
+sub_cache = {}  # user_id -> (timestamp, is_subscribed)
+
+
+async def check_subscription(user_id: int, force: bool = False) -> bool:
+    """Проверить подписку на канал. Кэш 5 минут."""
+    now = time.time()
+    if not force:
+        cached = sub_cache.get(user_id)
+        if cached and (now - cached[0]) < 300:
+            return cached[1]
+
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        result = member.status in ("member", "administrator", "creator", "restricted")
+    except Exception as e:
+        logging.error(f"[sub] ошибка проверки: {e}")
+        # При ошибке (например бот не админ канала) — пропускаем всех
+        result = True
+
+    sub_cache[user_id] = (now, result)
+    return result
+
+
+async def send_subscribe_message(message: types.Message):
+    """Показать сообщение с просьбой подписаться."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📢 Подписаться на канал", url=CHANNEL_URL)
+    builder.button(text="✅ Я подписался", callback_data="check_sub")
+    builder.adjust(1)
+
+    await message.answer(
+        "📢 *Подпишись на наш канал!*\n\n"
+        "Чтобы пользоваться ботом, подпишись на:\n"
+        "👉 @MusiclyLub\n\n"
+        "Там новости музыки, андеграунд, подборки и факты.\n\n"
+        "После подписки нажми «✅ Я подписался»",
+        reply_markup=builder.as_markup(),
+        parse_mode="Markdown"
+    )
+
+
+class SubscriptionMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        # Определяем пользователя
+        if isinstance(event, types.CallbackQuery):
+            user = event.from_user
+            # Пропускаем callback "check_sub" — иначе цикл
+            if event.data == "check_sub":
+                return await handler(event, data)
+            is_callback = True
+        elif isinstance(event, types.Message):
+            user = event.from_user
+            is_callback = False
+        else:
+            return await handler(event, data)
+
+        if user is None:
+            return await handler(event, data)
+
+        # Админ — всегда проходит
+        if is_admin(user):
+            return await handler(event, data)
+
+        # Проверяем подписку
+        if not await check_subscription(user.id):
+            if is_callback:
+                await event.answer(
+                    "⚠️ Сначала подпишись на @MusiclyLub!",
+                    show_alert=True
+                )
+            else:
+                await send_subscribe_message(event)
+            return
+
+        return await handler(event, data)
 
 
 # ============ АНТИСПАМ ============
@@ -104,7 +182,6 @@ WAVE_QUERIES = [
     "drum and bass",
 ]
 
-# Лимит волны для бесплатных
 WAVE_DAILY_LIMIT = 5
 wave_counter = defaultdict(lambda: {"date": "", "count": 0})
 
@@ -121,7 +198,7 @@ def check_wave_limit(user_id: int) -> bool:
     return True
 
 
-# ============ АНТИСПАМ: ЛОГИКА ============
+# ============ АНТИСПАМ ЛОГИКА ============
 
 def load_banned():
     global banned_users
@@ -240,7 +317,6 @@ async def cmd_start(message: types.Message):
     if is_banned_fast(message.from_user.id):
         return
 
-    # Автовыдача премиума админу
     ensure_admin_premium(message.from_user)
 
     db.add_user(
@@ -293,9 +369,34 @@ async def cmd_help(message: types.Message):
         f"/premium — ⭐ премиум-подписка\n"
         f"/donate — поддержать проект ⭐\n"
         f"/help — эта справка\n\n"
+        f"📢 Канал: @MusiclyLub\n\n"
         f"_Бот создан PufenshuyVV_"
     )
     await message.answer(text, parse_mode="Markdown")
+
+
+# ============ CALLBACK ПРОВЕРКИ ПОДПИСКИ ============
+
+@dp.callback_query(F.data == "check_sub")
+async def cb_check_sub(call: types.CallbackQuery):
+    if await check_subscription(call.from_user.id, force=True):
+        await call.answer("✅ Спасибо за подписку!")
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
+        await bot.send_message(
+            call.from_user.id,
+            "🎵 *Отлично!* Теперь пользуйся ботом.\n\n"
+            "Напиши название трека — найду музыку.\n"
+            "Или жми /help для списка команд.",
+            parse_mode="Markdown"
+        )
+    else:
+        await call.answer(
+            "❌ Ты ещё не подписался на @MusiclyLub!",
+            show_alert=True
+        )
 
 
 # ============ ПРЕМИУМ ============
@@ -378,16 +479,14 @@ async def cb_buy_premium(call: types.CallbackQuery):
 @dp.message(Command(ADMIN_SECRET_CMD))
 async def cmd_admin_stats(message: types.Message):
     if not is_admin(message.from_user):
-        return  # Молча игнор для всех остальных
+        return
 
-    # === Онлайн (активные за последние 5 минут) ===
     now = time.time()
     online = 0
     for uid, timestamps in user_tracker.items():
         if timestamps and (now - timestamps[-1]) < 300:
             online += 1
 
-    # === Статистика из базы ===
     total_users = db.get_total_users()
     users_today = db.get_users_today()
     active_today = db.get_active_users_today()
@@ -526,7 +625,6 @@ async def do_album_search(message: types.Message, album_name: str):
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await proc.communicate()
-        logging.info(f"[album] url search rc={proc.returncode}")
 
         tracks = []
         for line in stdout.decode(errors="ignore").strip().split("\n"):
@@ -539,7 +637,6 @@ async def do_album_search(message: types.Message, album_name: str):
                     tracks.append((url, title))
 
         if not tracks:
-            logging.warning(f"[album] no tracks found")
             await status.edit_text(
                 "❌ *Альбом не найден.*\n\nПопробуй точное название.",
                 parse_mode="Markdown"
@@ -548,7 +645,7 @@ async def do_album_search(message: types.Message, album_name: str):
             return
 
         await status.edit_text(
-            f"📀 *Найдено {len(tracks)} треков. Качаю в 3 потока...*",
+            f"📀 *Найдено {len(tracks)} треков. Качаю...*",
             parse_mode="Markdown"
         )
 
@@ -842,7 +939,6 @@ async def search_music(message: types.Message):
 
 
 async def do_search(message: types.Message, query: str):
-    # === КЭШ ===
     cached = db.get_cached_track(query)
     if cached:
         title, artist, file_id = cached
@@ -870,8 +966,6 @@ async def do_search(message: types.Message, query: str):
     output_template = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
 
     print_fmt = "after_move:%(title)s\t%(uploader)s\t%(filepath)s"
-
-    # Качество зависит от премиума
     quality = "320K" if db.is_premium(message.from_user.id) else "192K"
 
     cmd = [
@@ -1048,6 +1142,10 @@ async def start_web_server():
 # ============ MAIN ============
 
 async def main():
+    # Регистрируем middleware (проверка подписки)
+    dp.message.middleware(SubscriptionMiddleware())
+    dp.callback_query.middleware(SubscriptionMiddleware())
+
     load_banned()
     asyncio.create_task(start_web_server())
 
