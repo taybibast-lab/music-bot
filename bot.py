@@ -64,7 +64,7 @@ user_tracker = defaultdict(list)
 bot_start_time = time.time()
 
 
-# ============ ВОЛНА: запросы ============
+# ============ ВОЛНА ============
 WAVE_QUERIES = [
     "русский рэп андеграунд",
     "русский рок",
@@ -172,12 +172,10 @@ async def send_captcha(message: types.Message):
 
 async def handle_captcha_answer(message: types.Message) -> bool:
     user_id = message.from_user.id
-
     if user_id not in captcha_state:
         return False
 
     state = captcha_state[user_id]
-
     try:
         answer = int(message.text.strip())
     except ValueError:
@@ -289,79 +287,147 @@ async def cmd_album(message: types.Message):
 
 
 async def do_album_search(message: types.Message, album_name: str):
-    status = await message.answer(
-        f"📀 *Ищу альбом:* {album_name}\n\n_Это может занять 1-2 минуты..._",
-        parse_mode="Markdown"
-    )
+    status = await message.answer("📀 *Ищу альбом...*", parse_mode="Markdown")
 
     tmp_dir = os.path.join(DOWNLOAD_DIR, str(uuid.uuid4()))
     os.makedirs(tmp_dir, exist_ok=True)
 
-    cmd = [
-        "yt-dlp",
-        f"scsearch:{album_name}",
-        "--yes-playlist",
-        "--max-downloads", "10",
-        "-x",
-        "--audio-format", "mp3",
-        "--audio-quality", "192K",
-        "-o", os.path.join(tmp_dir, "%(title)s.%(ext)s"),
-        "--max-filesize", "25M",
-    ]
-
     try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
+        # === ШАГ 1: получаем URL'ы треков (быстро) ===
+        info_cmd = [
+            "yt-dlp",
+            f"scsearch:{album_name}",
+            "--flat-playlist",
+            "--playlist-end", "10",
+            "--print", "%(url)s|||%(title)s",
+            "--skip-download",
+            "--no-warnings",
+            "-q",
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *info_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
+        stdout, stderr = await proc.communicate()
 
-        files = sorted(os.listdir(tmp_dir))
-        mp3_files = [f for f in files if f.endswith(".mp3")]
+        tracks = []
+        for line in stdout.decode(errors="ignore").strip().split("\n"):
+            line = line.strip()
+            if "|||" in line:
+                url, title = line.split("|||", 1)
+                url = url.strip()
+                title = title.strip()
+                if url.startswith("http"):
+                    tracks.append((url, title))
 
-        if not mp3_files:
+        if not tracks:
             await status.edit_text(
-                "❌ *Альбом не найден.*\n\n"
-                "Попробуй другой запрос или точное название.",
+                "❌ *Альбом не найден.*\n\nПопробуй точное название.",
                 parse_mode="Markdown"
             )
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return
 
         await status.edit_text(
-            f"📀 *Найдено треков:* {len(mp3_files)}\n\n_Отправляю..._",
+            f"📀 *Найдено {len(tracks)} треков. Качаю...*",
             parse_mode="Markdown"
         )
 
-        sent_count = 0
-        for filename in mp3_files[:10]:
-            filepath = os.path.join(tmp_dir, filename)
-            title = filename[:-4][:60]
+        # === ШАГ 2: параллельное скачивание (2 одновременно) ===
+        sem = asyncio.Semaphore(2)
+        sent_count = [0]
+        print_fmt = "after_move:%(title)s\t%(uploader)s\t%(filepath)s"
 
-            try:
-                audio = types.FSInputFile(filepath, filename=filename)
-                sent = await message.answer_audio(
-                    audio=audio,
-                    title=title,
-                    performer="Music Bot",
-                )
-                tg_file_id = sent.audio.file_id
-                db.add_history(message.from_user.id, album_name, title, tg_file_id)
-                sent_count += 1
-            except Exception as e:
-                logging.warning(f"Не отправил {filename}: {e}")
+        async def download_and_send(url, fallback_title):
+            async with sem:
+                track_id = str(uuid.uuid4())
+                out_template = os.path.join(tmp_dir, f"{track_id}.%(ext)s")
 
-        await status.delete()
+                dl_cmd = [
+                    "yt-dlp", url,
+                    "-x",
+                    "--audio-format", "mp3",
+                    "--audio-quality", "192K",
+                    "-o", out_template,
+                    "--no-playlist",
+                    "--max-filesize", "25M",
+                    "--print", print_fmt,
+                    "--no-warnings",
+                    "-q",
+                    "--no-check-certificates",
+                    "--socket-timeout", "15",
+                ]
 
-        if sent_count > 10:
-            await message.answer(f"📀 Всего было {sent_count} треков, отправлено 10.")
+                try:
+                    p = await asyncio.create_subprocess_exec(
+                        *dl_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    out, _ = await p.communicate()
+
+                    # Парсим метаданные
+                    real_title = fallback_title[:80]
+                    real_artist = "Music Bot"
+                    mp3 = None
+
+                    for line in out.decode(errors="ignore").split("\n"):
+                        line = line.strip()
+                        if line.count("\t") >= 2:
+                            parts = line.split("\t")
+                            real_title = parts[0].strip()[:80] or fallback_title[:80]
+                            real_artist = parts[1].strip()[:60] or "Music Bot"
+                            mp3 = parts[2].strip()
+                            break
+
+                    if not mp3 or not os.path.exists(mp3):
+                        mp3 = os.path.join(tmp_dir, f"{track_id}.mp3")
+                        if not os.path.exists(mp3):
+                            files = [f for f in os.listdir(tmp_dir) if f.startswith(track_id)]
+                            if not files:
+                                return
+                            mp3 = os.path.join(tmp_dir, files[0])
+
+                    audio = types.FSInputFile(mp3, filename=f"{real_title}.mp3")
+                    sent = await message.answer_audio(
+                        audio=audio,
+                        title=real_title,
+                        performer=real_artist,
+                    )
+                    db.add_history(
+                        message.from_user.id, album_name,
+                        real_title, sent.audio.file_id
+                    )
+                    sent_count[0] += 1
+
+                    try:
+                        os.remove(mp3)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logging.warning(f"Album track error {fallback_title}: {e}")
+
+        tasks = [download_and_send(url, title) for url, title in tracks]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+        if sent_count[0] == 0:
+            await message.answer("❌ Не удалось скачать ни одного трека.")
 
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     except Exception as e:
         logging.exception("Ошибка при поиске альбома")
-        await status.edit_text(f"⚠️ Ошибка: {str(e)[:200]}")
+        try:
+            await status.edit_text(f"⚠️ Ошибка: {str(e)[:200]}")
+        except Exception:
+            pass
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
@@ -396,7 +462,6 @@ async def cb_donate(call: types.CallbackQuery):
         return
 
     amount = int(call.data.split(":", 1)[1])
-
     if amount < 10 or amount > 10000:
         await call.answer("Сумма должна быть от 10 до 10 000 ⭐")
         return
@@ -450,15 +515,10 @@ async def cmd_likes(message: types.Message):
     await message.answer(f"❤️ Твои лайки ({len(likes)}):")
     for like_id, query, title, file_id in likes:
         builder = InlineKeyboardBuilder()
-        builder.button(
-            text="❌ Убрать из избранного",
-            callback_data=f"unlike:{like_id}"
-        )
+        builder.button(text="❌ Убрать из избранного", callback_data=f"unlike:{like_id}")
         try:
             await message.answer_audio(
-                audio=file_id,
-                title=title,
-                performer="Music Bot",
+                audio=file_id, title=title, performer="Music Bot",
                 reply_markup=builder.as_markup()
             )
         except Exception as e:
@@ -480,18 +540,12 @@ async def cmd_history(message: types.Message):
         hist_row = db.get_history_by_file_id(message.from_user.id, file_id)
         if not hist_row:
             continue
-
         history_id, _ = hist_row
         builder = InlineKeyboardBuilder()
-        builder.button(
-            text="🔁 Найти снова",
-            callback_data=f"repeat:{history_id}"
-        )
+        builder.button(text="🔁 Найти снова", callback_data=f"repeat:{history_id}")
         try:
             await message.answer_audio(
-                audio=file_id,
-                title=title,
-                performer="Music Bot",
+                audio=file_id, title=title, performer="Music Bot",
                 reply_markup=builder.as_markup()
             )
         except Exception as e:
@@ -516,10 +570,8 @@ async def search_music(message: types.Message):
 
     if is_old_message(message.date):
         return
-
     if is_banned_fast(user_id):
         return
-
     if await handle_captcha_answer(message):
         return
 
@@ -550,10 +602,33 @@ async def search_music(message: types.Message):
 
 
 async def do_search(message: types.Message, query: str):
+    # === КЭШ ===
+    cached = db.get_cached_track(query)
+    if cached:
+        title, artist, file_id = cached
+        try:
+            sent = await message.answer_audio(
+                audio=file_id,
+                title=title,
+                performer=artist or "Music Bot",
+            )
+            db.add_history(message.from_user.id, query, title, file_id)
+            history_id = db.get_last_history_id(message.from_user.id)
+            liked = db.is_liked(message.from_user.id, file_id)
+            await sent.edit_reply_markup(
+                reply_markup=build_track_keyboard(history_id, liked)
+            )
+            logging.info(f"[cache] hit: {query}")
+            return
+        except Exception as e:
+            logging.warning(f"[cache] miss: {e}")
+
     status = await message.answer(f"🔍 Ищу: *{query}*...", parse_mode="Markdown")
 
     file_id = str(uuid.uuid4())
     output_template = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
+
+    print_fmt = "after_move:%(title)s\t%(uploader)s\t%(filepath)s"
 
     cmd = [
         "yt-dlp",
@@ -564,7 +639,11 @@ async def do_search(message: types.Message, query: str):
         "-o", output_template,
         "--no-playlist",
         "--max-filesize", "25M",
-        "--print", "after_move:filepath",
+        "--print", print_fmt,
+        "--no-warnings",
+        "-q",
+        "--no-check-certificates",
+        "--socket-timeout", "15",
     ]
 
     try:
@@ -580,28 +659,45 @@ async def do_search(message: types.Message, query: str):
             logging.error(f"yt-dlp error: {stderr.decode(errors='ignore')[-500:]}")
             return
 
-        mp3_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp3")
-        if not os.path.exists(mp3_path):
-            files = [f for f in os.listdir(DOWNLOAD_DIR) if f.startswith(file_id)]
-            if not files:
-                await status.edit_text("❌ Файл не нашёлся после скачивания.")
-                return
-            mp3_path = os.path.join(DOWNLOAD_DIR, files[0])
+        # === Парсим метаданные ===
+        out = stdout.decode(errors="ignore")
+        real_title = query[:60]
+        real_artist = "Music Bot"
+        mp3_path = None
 
-        title = query[:60]
+        for line in out.split("\n"):
+            line = line.strip()
+            if line.count("\t") >= 2:
+                parts = line.split("\t")
+                real_title = parts[0].strip()[:80] or query[:60]
+                real_artist = parts[1].strip()[:60] or "Music Bot"
+                mp3_path = parts[2].strip()
+                break
 
-        audio = types.FSInputFile(mp3_path, filename=f"{title}.mp3")
+        if not mp3_path or not os.path.exists(mp3_path):
+            fallback = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp3")
+            if os.path.exists(fallback):
+                mp3_path = fallback
+            else:
+                files = [f for f in os.listdir(DOWNLOAD_DIR) if f.startswith(file_id)]
+                if not files:
+                    await status.edit_text("❌ Файл не нашёлся после скачивания.")
+                    return
+                mp3_path = os.path.join(DOWNLOAD_DIR, files[0])
+
+        audio = types.FSInputFile(mp3_path, filename=f"{real_title}.mp3")
         sent = await message.answer_audio(
             audio=audio,
-            title=title,
-            performer="Music Bot",
+            title=real_title,
+            performer=real_artist,
         )
 
         tg_file_id = sent.audio.file_id
 
-        db.add_history(message.from_user.id, query, title, tg_file_id)
-        history_id = db.get_last_history_id(message.from_user.id)
+        db.add_history(message.from_user.id, query, real_title, tg_file_id)
+        db.cache_track(query, real_title, real_artist, tg_file_id)
 
+        history_id = db.get_last_history_id(message.from_user.id)
         liked = db.is_liked(message.from_user.id, tg_file_id)
 
         await sent.edit_reply_markup(
@@ -626,22 +722,14 @@ async def do_search(message: types.Message, query: str):
 async def cb_like(call: types.CallbackQuery):
     if is_banned_fast(call.from_user.id):
         return
-
     _, history_id = call.data.split(":", 1)
     row = db.get_history_by_id(int(history_id))
-
     if not row:
         await call.answer("Трек не найден")
         return
-
     query, title, file_id = row
     added = db.add_like(call.from_user.id, query, title, file_id)
-
-    if added:
-        await call.answer("❤️ Добавлено в избранное!")
-    else:
-        await call.answer("Уже в избранном")
-
+    await call.answer("❤️ Добавлено!" if added else "Уже в избранном")
     try:
         await call.message.edit_reply_markup(
             reply_markup=build_track_keyboard(int(history_id), liked=True)
@@ -659,35 +747,29 @@ async def cb_nolike(call: types.CallbackQuery):
 async def cb_unlike(call: types.CallbackQuery):
     if is_banned_fast(call.from_user.id):
         return
-
     _, like_id = call.data.split(":", 1)
     deleted = db.remove_like_by_id(int(like_id), call.from_user.id)
-
     if deleted:
-        await call.answer("❌ Убрано из избранного")
+        await call.answer("❌ Убрано")
         try:
             await call.message.delete()
-        except Exception as e:
-            logging.warning(f"Не удалил сообщение: {e}")
+        except Exception:
+            pass
     else:
-        await call.answer("Не нашёл в избранном")
+        await call.answer("Не нашёл")
 
 
 @dp.callback_query(F.data.startswith("repeat:"))
 async def cb_repeat(call: types.CallbackQuery):
     if is_banned_fast(call.from_user.id):
         return
-
     _, history_id = call.data.split(":", 1)
     row = db.get_history_by_id(int(history_id))
-
     if not row:
         await call.answer("Трек не найден")
         return
-
     query, title, file_id = row
     await call.answer(f"🔍 Ищу: {query}")
-
     await do_search(call.message, query)
 
 
@@ -702,13 +784,10 @@ async def cb_similar(call: types.CallbackQuery):
 async def start_web_server():
     async def handle(request):
         return web.Response(text="OK")
-
     app = web.Application()
     app.router.add_get("/", handle)
     app.router.add_get("/ping", handle)
-
     port = int(os.environ.get("PORT", 8080))
-
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
