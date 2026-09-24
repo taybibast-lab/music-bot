@@ -4,6 +4,7 @@ import os
 import uuid
 import time
 import random
+import shutil
 from collections import defaultdict
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -14,7 +15,7 @@ from aiohttp import web
 from config import BOT_TOKEN
 import database as db
 
-# === FFMPEG для Render (static-ffmpeg) ===
+# === FFMPEG ===
 try:
     from static_ffmpeg import run as _ffmpeg_run
     _ffmpeg_path, _ffprobe_path = _ffmpeg_run.get_or_fetch_platform_executables_else_raise()
@@ -47,7 +48,7 @@ def is_admin(user) -> bool:
     return False
 
 
-# ============ АНТИСПАМ: НАСТРОЙКИ ============
+# ============ АНТИСПАМ ============
 SPAM_LIMIT = 15
 SPAM_WINDOW = 3
 BOT_INTERVAL_WINDOW = 10
@@ -57,12 +58,35 @@ MAX_CAPTCHA_TRIES = 3
 OLD_MESSAGE_AGE = 30
 BOT_WARMUP_TIME = 30
 
-
-# ============ АНТИСПАМ: ПАМЯТЬ ============
 banned_users = set()
-captcha_state = {}                 # user_id -> {"answer": int, "tries": int}
-user_tracker = defaultdict(list)   # user_id -> [timestamps]
+captcha_state = {}
+user_tracker = defaultdict(list)
 bot_start_time = time.time()
+
+
+# ============ ВОЛНА: запросы ============
+WAVE_QUERIES = [
+    "русский рэп андеграунд",
+    "русский рок",
+    "славянский фолк",
+    "электроника техно",
+    "инди музыка новая",
+    "поп 2024",
+    "хип-хоп новый",
+    "метал русский",
+    "джаз",
+    "блюз",
+    "классика",
+    "регги",
+    "панк русский",
+    "пост-панк",
+    "лоу-фай",
+    "фонк",
+    "drill",
+    "трэп",
+    "хаус",
+    "drum and bass",
+]
 
 
 # ============ АНТИСПАМ: ЛОГИКА ============
@@ -86,12 +110,10 @@ def is_spamming(user_id: int, msg_time: float) -> bool:
     user_tracker[user_id].append(now)
     timestamps = user_tracker[user_id]
 
-    # Проверка А: флуд
     recent = [t for t in timestamps if now - t < SPAM_WINDOW]
     if len(recent) > SPAM_LIMIT:
         return True
 
-    # Проверка Б: идеальные интервалы (бот)
     if len(timestamps) >= BOT_INTERVAL_COUNT + 1:
         intervals = [
             timestamps[i + 1] - timestamps[i]
@@ -121,7 +143,6 @@ def reset_user_tracker(user_id: int):
 
 
 def ban_user(user_id: int, reason: str = "spam"):
-    """Забанить юзера (и в базу, и в память)."""
     db.add_banned(user_id, reason)
     banned_users.add(user_id)
     captcha_state.pop(user_id, None)
@@ -131,7 +152,6 @@ def ban_user(user_id: int, reason: str = "spam"):
 # ============ КАПЧА ============
 
 async def send_captcha(message: types.Message):
-    """Отправить капчу юзеру."""
     user_id = message.from_user.id
     a = random.randint(2, 9)
     b = random.randint(2, 9)
@@ -151,10 +171,6 @@ async def send_captcha(message: types.Message):
 
 
 async def handle_captcha_answer(message: types.Message) -> bool:
-    """
-    Обработать ответ на капчу.
-    Возвращает True, если сообщение было ответом на капчу.
-    """
     user_id = message.from_user.id
 
     if user_id not in captcha_state:
@@ -162,7 +178,6 @@ async def handle_captcha_answer(message: types.Message) -> bool:
 
     state = captcha_state[user_id]
 
-    # Пытаемся распарсить число
     try:
         answer = int(message.text.strip())
     except ValueError:
@@ -170,20 +185,15 @@ async def handle_captcha_answer(message: types.Message) -> bool:
         return True
 
     if answer == state["answer"]:
-        # Правильно
         captcha_state.pop(user_id, None)
         reset_user_tracker(user_id)
         await message.answer("✅ Проверка пройдена. Пиши дальше.")
         return True
     else:
-        # Неправильно
         state["tries"] += 1
-
         if state["tries"] >= MAX_CAPTCHA_TRIES:
             ban_user(user_id, "captcha_failed")
-            await message.answer(
-                "🚫 Ты не прошёл проверку. Доступ заблокирован."
-            )
+            await message.answer("🚫 Ты не прошёл проверку. Доступ заблокирован.")
             captcha_state.pop(user_id, None)
         else:
             remaining = MAX_CAPTCHA_TRIES - state["tries"]
@@ -214,6 +224,8 @@ async def cmd_start(message: types.Message):
         f"📋 Команды:\n"
         f"/likes — твои лайки\n"
         f"/history — что слушал\n"
+        f"/wave — 🌊 случайный трек\n"
+        f"/album — 📀 поиск по альбому\n"
         f"/donate — поддержать проект ⭐\n"
         f"/help — помощь"
     )
@@ -234,11 +246,123 @@ async def cmd_help(message: types.Message):
         f"/start — запуск\n"
         f"/likes — избранное\n"
         f"/history — история\n"
+        f"/wave — 🌊 случайный трек\n"
+        f"/album [название] — 📀 весь альбом\n"
         f"/donate — поддержать проект ⭐\n"
         f"/help — эта справка\n\n"
         f"_Бот создан PufenshuyVV_"
     )
     await message.answer(text, parse_mode="Markdown")
+
+
+# ============ ВОЛНА ============
+
+@dp.message(Command("wave"))
+async def cmd_wave(message: types.Message):
+    if is_banned_fast(message.from_user.id):
+        return
+
+    query = random.choice(WAVE_QUERIES)
+    await message.answer(f"🌊 *Волна*: {query}", parse_mode="Markdown")
+    await do_search(message, query)
+
+
+# ============ АЛЬБОМ ============
+
+@dp.message(Command("album"))
+async def cmd_album(message: types.Message):
+    if is_banned_fast(message.from_user.id):
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer(
+            "📀 *Поиск по альбому*\n\n"
+            "Напиши: `/album название альбома`\n"
+            "Например: `/album Группа крови`",
+            parse_mode="Markdown"
+        )
+        return
+
+    album_name = args[1].strip()
+    await do_album_search(message, album_name)
+
+
+async def do_album_search(message: types.Message, album_name: str):
+    status = await message.answer(
+        f"📀 *Ищу альбом:* {album_name}\n\n_Это может занять 1-2 минуты..._",
+        parse_mode="Markdown"
+    )
+
+    tmp_dir = os.path.join(DOWNLOAD_DIR, str(uuid.uuid4()))
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    cmd = [
+        "yt-dlp",
+        f"scsearch:{album_name}",
+        "--yes-playlist",
+        "--max-downloads", "10",
+        "-x",
+        "--audio-format", "mp3",
+        "--audio-quality", "192K",
+        "-o", os.path.join(tmp_dir, "%(title)s.%(ext)s"),
+        "--max-filesize", "25M",
+    ]
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+
+        files = sorted(os.listdir(tmp_dir))
+        mp3_files = [f for f in files if f.endswith(".mp3")]
+
+        if not mp3_files:
+            await status.edit_text(
+                "❌ *Альбом не найден.*\n\n"
+                "Попробуй другой запрос или точное название.",
+                parse_mode="Markdown"
+            )
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return
+
+        await status.edit_text(
+            f"📀 *Найдено треков:* {len(mp3_files)}\n\n_Отправляю..._",
+            parse_mode="Markdown"
+        )
+
+        sent_count = 0
+        for filename in mp3_files[:10]:
+            filepath = os.path.join(tmp_dir, filename)
+            title = filename[:-4][:60]
+
+            try:
+                audio = types.FSInputFile(filepath, filename=filename)
+                sent = await message.answer_audio(
+                    audio=audio,
+                    title=title,
+                    performer="Music Bot",
+                )
+                tg_file_id = sent.audio.file_id
+                db.add_history(message.from_user.id, album_name, title, tg_file_id)
+                sent_count += 1
+            except Exception as e:
+                logging.warning(f"Не отправил {filename}: {e}")
+
+        await status.delete()
+
+        if sent_count > 10:
+            await message.answer(f"📀 Всего было {sent_count} треков, отправлено 10.")
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    except Exception as e:
+        logging.exception("Ошибка при поиске альбома")
+        await status.edit_text(f"⚠️ Ошибка: {str(e)[:200]}")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ============ DONATE ============
@@ -384,30 +508,24 @@ def build_track_keyboard(history_id: int, liked: bool = False):
     return builder.as_markup()
 
 
-# ============ SEARCH (с антиспамом!) ============
+# ============ SEARCH ============
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def search_music(message: types.Message):
     user_id = message.from_user.id
 
-    # 1. Старое сообщение (из очереди Render) — игнор
     if is_old_message(message.date):
         return
 
-    # 2. Бан (мгновенно, без SQL)
     if is_banned_fast(user_id):
         return
 
-    # 3. Капча активна? → обработка ответа
     if await handle_captcha_answer(message):
         return
 
-    # 4. Прогрев бота (первые 30 сек) — не баним
     if not bot_is_warming_up():
-        # 5. Спам? → капча
         msg_time = message.date.timestamp()
         if is_spamming(user_id, msg_time):
-            # Админ — пасхалка
             if is_admin(message.from_user):
                 await message.answer(
                     "Господин, будь вы ботом — мы бы вас забанили 😏\n\n"
@@ -417,7 +535,6 @@ async def search_music(message: types.Message):
             await send_captcha(message)
             return
 
-    # 6. Обычный поиск
     query = message.text.strip()
     if not query:
         await message.answer("Напиши что искать 🤔")
@@ -609,6 +726,8 @@ async def main():
         BotCommand(command="start", description="🚀 Запустить бота"),
         BotCommand(command="likes", description="❤️ Мои лайки"),
         BotCommand(command="history", description="🕐 История"),
+        BotCommand(command="wave", description="🌊 Случайный трек"),
+        BotCommand(command="album", description="📀 Поиск по альбому"),
         BotCommand(command="donate", description="⭐ Поддержать проект"),
         BotCommand(command="help", description="❓ Помощь"),
     ]
