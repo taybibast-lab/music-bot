@@ -6,6 +6,7 @@ import time
 import random
 import shutil
 from collections import defaultdict
+from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -39,6 +40,14 @@ db.init_db()
 ADMIN_ID = 8933557359
 ADMIN_USERNAME = "puffvsv"
 
+# Премиум для всех
+PREMIUM_STARS = 50           # 50 ⭐ за 30 дней
+PREMIUM_DAYS = 30
+ADMIN_FREE_DAYS = 36500      # ~100 лет — по факту навсегда
+
+# Секретная команда админа
+ADMIN_SECRET_CMD = "CheckAdmin1121"
+
 
 def is_admin(user) -> bool:
     if user.id == ADMIN_ID:
@@ -46,6 +55,13 @@ def is_admin(user) -> bool:
     if (user.username or "").lower() == ADMIN_USERNAME.lower():
         return True
     return False
+
+
+def ensure_admin_premium(user):
+    """Выдать админу премиум, если ещё нет."""
+    if is_admin(user) and not db.is_premium(user.id):
+        db.add_premium(user.id, days=ADMIN_FREE_DAYS)
+        logging.info(f"[premium] выдан админу {user.id}")
 
 
 # ============ АНТИСПАМ ============
@@ -87,6 +103,22 @@ WAVE_QUERIES = [
     "хаус",
     "drum and bass",
 ]
+
+# Лимит волны для бесплатных
+WAVE_DAILY_LIMIT = 5
+wave_counter = defaultdict(lambda: {"date": "", "count": 0})
+
+
+def check_wave_limit(user_id: int) -> bool:
+    today = datetime.now().strftime("%Y-%m-%d")
+    state = wave_counter[user_id]
+    if state["date"] != today:
+        state["date"] = today
+        state["count"] = 0
+    if state["count"] >= WAVE_DAILY_LIMIT:
+        return False
+    state["count"] += 1
+    return True
 
 
 # ============ АНТИСПАМ: ЛОГИКА ============
@@ -208,13 +240,21 @@ async def cmd_start(message: types.Message):
     if is_banned_fast(message.from_user.id):
         return
 
+    # Автовыдача премиума админу
+    ensure_admin_premium(message.from_user)
+
     db.add_user(
         message.from_user.id,
         message.from_user.username or "",
         message.from_user.first_name or ""
     )
+
+    is_prem = db.is_premium(message.from_user.id)
+    premium_line = "⭐ *Премиум-пользователь*\n\n" if is_prem else ""
+
     text = (
         f"Привет, {message.from_user.first_name}! 👋\n\n"
+        f"{premium_line}"
         f"🎵 Я — музыкальный бот, созданный PufenshuyVV.\n\n"
         f"Просто напиши название трека или исполнителя — "
         f"я найду и пришлю тебе музыку прямо в Telegram.\n\n"
@@ -224,16 +264,19 @@ async def cmd_start(message: types.Message):
         f"/history — что слушал\n"
         f"/wave — 🌊 случайный трек\n"
         f"/album — 📀 поиск по альбому\n"
+        f"/premium — ⭐ премиум\n"
         f"/donate — поддержать проект ⭐\n"
         f"/help — помощь"
     )
-    await message.answer(text)
+    await message.answer(text, parse_mode="Markdown")
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
     if is_banned_fast(message.from_user.id):
         return
+
+    ensure_admin_premium(message.from_user)
 
     text = (
         f"🤖 *Как пользоваться ботом:*\n\n"
@@ -247,9 +290,130 @@ async def cmd_help(message: types.Message):
         f"/history — история\n"
         f"/wave — 🌊 случайный трек\n"
         f"/album [название] — 📀 весь альбом\n"
+        f"/premium — ⭐ премиум-подписка\n"
         f"/donate — поддержать проект ⭐\n"
         f"/help — эта справка\n\n"
         f"_Бот создан PufenshuyVV_"
+    )
+    await message.answer(text, parse_mode="Markdown")
+
+
+# ============ ПРЕМИУМ ============
+
+@dp.message(Command("premium"))
+async def cmd_premium(message: types.Message):
+    if is_banned_fast(message.from_user.id):
+        return
+
+    ensure_admin_premium(message.from_user)
+
+    user_id = message.from_user.id
+
+    if db.is_premium(user_id):
+        until = db.get_premium_until(user_id)
+        until_text = ""
+        if until:
+            try:
+                dt = datetime.fromisoformat(until)
+                until_text = f"\n_Активен до: {dt.strftime('%d.%m.%Y')}_"
+            except Exception:
+                pass
+
+        await message.answer(
+            f"⭐ *У тебя активен премиум!*\n\n"
+            f"Что доступно:\n"
+            f"🌊 Волна без лимита (у бесплатных — {WAVE_DAILY_LIMIT}/день)\n"
+            f"🎧 Качество 320 kbps\n"
+            f"🚫 Без напоминаний о донате"
+            f"{until_text}",
+            parse_mode="Markdown"
+        )
+        return
+
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text=f"⭐ Купить премиум — {PREMIUM_STARS} ⭐",
+        callback_data=f"buy_premium:{PREMIUM_STARS}"
+    )
+
+    await message.answer(
+        f"⭐ *Премиум-подписка*\n\n"
+        f"*Что даёт:*\n"
+        f"🌊 Волна без лимита (у бесплатных — {WAVE_DAILY_LIMIT}/день)\n"
+        f"🎧 Качество 320 kbps\n"
+        f"🚫 Без напоминаний о донате\n\n"
+        f"*Цена:* {PREMIUM_STARS} ⭐ за {PREMIUM_DAYS} дней\n\n"
+        f"_Купить звёзды: настройки Telegram → Telegram Stars_\n"
+        f"_Бесплатная версия тоже работает — премиум просто удобнее_ 😊",
+        reply_markup=builder.as_markup(),
+        parse_mode="Markdown"
+    )
+
+
+@dp.callback_query(F.data.startswith("buy_premium:"))
+async def cb_buy_premium(call: types.CallbackQuery):
+    if is_banned_fast(call.from_user.id):
+        return
+
+    amount = int(call.data.split(":", 1)[1])
+    await call.answer()
+
+    try:
+        await bot.send_invoice(
+            chat_id=call.from_user.id,
+            title="Премиум-подписка на 30 дней",
+            description="Волна без лимита, 320 kbps, без напоминаний",
+            payload=f"premium_{PREMIUM_DAYS}_{call.from_user.id}",
+            provider_token="",
+            currency="XTR",
+            prices=[LabeledPrice(label="Премиум 30 дней", amount=amount)],
+        )
+    except Exception as e:
+        logging.exception("Ошибка премиум-инвойса")
+        await call.message.answer(f"⚠️ Ошибка: {str(e)[:150]}")
+
+
+# ============ СЕКРЕТНАЯ АДМИН-КОМАНДА ============
+
+@dp.message(Command(ADMIN_SECRET_CMD))
+async def cmd_admin_stats(message: types.Message):
+    if not is_admin(message.from_user):
+        return  # Молча игнор для всех остальных
+
+    # === Онлайн (активные за последние 5 минут) ===
+    now = time.time()
+    online = 0
+    for uid, timestamps in user_tracker.items():
+        if timestamps and (now - timestamps[-1]) < 300:
+            online += 1
+
+    # === Статистика из базы ===
+    total_users = db.get_total_users()
+    users_today = db.get_users_today()
+    active_today = db.get_active_users_today()
+    tracks_today = db.get_tracks_today()
+    total_tracks = db.get_total_tracks()
+    premium_count = db.get_premium_count()
+    banned_count = db.get_banned_count()
+    top_queries = db.get_top_queries(5)
+
+    top_text = ""
+    if top_queries:
+        top_text = "\n\n*🔝 Топ-5 запросов:*\n"
+        for i, (q, cnt) in enumerate(top_queries, 1):
+            top_text += f"{i}. `{q}` — {cnt}\n"
+
+    text = (
+        f"📊 *Статистика бота*\n\n"
+        f"*🟢 Онлайн:* {online} (за 5 мин)\n"
+        f"*👥 Всего юзеров:* {total_users}\n"
+        f"*📅 Зашли сегодня:* {users_today}\n"
+        f"*🔍 Активны сегодня:* {active_today}\n\n"
+        f"*🎵 Треков сегодня:* {tracks_today}\n"
+        f"*🎵 Треков всего:* {total_tracks}\n\n"
+        f"*⭐ Премиум:* {premium_count}\n"
+        f"*🚫 Забанено:* {banned_count}"
+        f"{top_text}"
     )
     await message.answer(text, parse_mode="Markdown")
 
@@ -260,6 +424,8 @@ async def cmd_help(message: types.Message):
 async def cmd_search(message: types.Message):
     if is_banned_fast(message.from_user.id):
         return
+
+    ensure_admin_premium(message.from_user)
 
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
@@ -293,6 +459,20 @@ async def cmd_wave(message: types.Message):
     if is_banned_fast(message.from_user.id):
         return
 
+    ensure_admin_premium(message.from_user)
+
+    user_id = message.from_user.id
+
+    if not db.is_premium(user_id):
+        if not check_wave_limit(user_id):
+            await message.answer(
+                f"🌊 *Волна*\n\n"
+                f"Лимит на сегодня исчерпан ({WAVE_DAILY_LIMIT} треков).\n"
+                f"Купи премиум → безлимит: /premium",
+                parse_mode="Markdown"
+            )
+            return
+
     query = random.choice(WAVE_QUERIES)
     await message.answer(f"🌊 *Волна*: {query}", parse_mode="Markdown")
     await do_search(message, query)
@@ -304,6 +484,8 @@ async def cmd_wave(message: types.Message):
 async def cmd_album(message: types.Message):
     if is_banned_fast(message.from_user.id):
         return
+
+    ensure_admin_premium(message.from_user)
 
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
@@ -326,7 +508,6 @@ async def do_album_search(message: types.Message, album_name: str):
     os.makedirs(tmp_dir, exist_ok=True)
 
     try:
-        # === ШАГ 1: получаем URL'ы треков ===
         info_cmd = [
             "yt-dlp",
             f"scsearch:{album_name}",
@@ -358,7 +539,7 @@ async def do_album_search(message: types.Message, album_name: str):
                     tracks.append((url, title))
 
         if not tracks:
-            logging.warning(f"[album] no tracks found, stderr={stderr.decode(errors='ignore')[-300:]}")
+            logging.warning(f"[album] no tracks found")
             await status.edit_text(
                 "❌ *Альбом не найден.*\n\nПопробуй точное название.",
                 parse_mode="Markdown"
@@ -371,7 +552,6 @@ async def do_album_search(message: types.Message, album_name: str):
             parse_mode="Markdown"
         )
 
-        # === ШАГ 2: параллельно 3 трека ===
         sem = asyncio.Semaphore(3)
         sent_count = [0]
         print_fmt = "after_move:%(title)s\t%(uploader)s\t%(filepath)s"
@@ -424,7 +604,6 @@ async def do_album_search(message: types.Message, album_name: str):
                         if not os.path.exists(mp3):
                             files = [f for f in os.listdir(tmp_dir) if f.startswith(track_id)]
                             if not files:
-                                logging.warning(f"[album] файл не найден для {fallback_title}")
                                 return
                             mp3 = os.path.join(tmp_dir, files[0])
 
@@ -457,8 +636,6 @@ async def do_album_search(message: types.Message, album_name: str):
 
         if sent_count[0] == 0:
             await message.answer("❌ Не удалось скачать ни одного трека.")
-        else:
-            logging.info(f"[album] отправлено {sent_count[0]} из {len(tracks)}")
 
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -530,14 +707,30 @@ async def process_pre_checkout(pre_checkout_q: types.PreCheckoutQuery):
 
 @dp.message(F.successful_payment)
 async def process_successful_payment(message: types.Message):
-    amount = message.successful_payment.total_amount
-    await message.answer(
-        f"🙏 *Спасибо за поддержку!*\n\n"
-        f"Ты отправил *{amount} ⭐*\n"
-        f"Это очень помогает развитию бота ❤️\n\n"
-        f"_Бот создан PufenshuyVV_",
-        parse_mode="Markdown"
-    )
+    payment = message.successful_payment
+    amount = payment.total_amount
+    payload = payment.invoice_payload
+    user_id = message.from_user.id
+
+    if payload.startswith("premium_"):
+        db.add_premium(user_id, days=PREMIUM_DAYS)
+        await message.answer(
+            f"🎉 *Премиум активирован!*\n\n"
+            f"Спасибо за поддержку ❤️\n\n"
+            f"Теперь тебе доступны:\n"
+            f"🌊 Волна без лимита\n"
+            f"🎧 Качество 320 kbps\n"
+            f"🚫 Без напоминаний\n\n"
+            f"_Действует {PREMIUM_DAYS} дней_",
+            parse_mode="Markdown"
+        )
+    else:
+        await message.answer(
+            f"🙏 *Спасибо за поддержку!*\n\n"
+            f"Ты отправил *{amount} ⭐*\n"
+            f"Это очень помогает развитию бота ❤️",
+            parse_mode="Markdown"
+        )
 
 
 # ============ LIKES / HISTORY ============
@@ -546,6 +739,8 @@ async def process_successful_payment(message: types.Message):
 async def cmd_likes(message: types.Message):
     if is_banned_fast(message.from_user.id):
         return
+
+    ensure_admin_premium(message.from_user)
 
     likes = db.get_likes_with_id(message.from_user.id, limit=20)
     if not likes:
@@ -569,6 +764,8 @@ async def cmd_likes(message: types.Message):
 async def cmd_history(message: types.Message):
     if is_banned_fast(message.from_user.id):
         return
+
+    ensure_admin_premium(message.from_user)
 
     history = db.get_history(message.from_user.id, limit=10)
     if not history:
@@ -614,6 +811,8 @@ async def search_music(message: types.Message):
         return
     if await handle_captcha_answer(message):
         return
+
+    ensure_admin_premium(message.from_user)
 
     if not bot_is_warming_up():
         msg_time = message.date.timestamp()
@@ -662,7 +861,6 @@ async def do_search(message: types.Message, query: str):
             logging.info(f"[cache] hit: {query}")
             return
         except Exception as e:
-            # file_id протух — удаляем из кэша и ищем заново
             logging.warning(f"[cache] invalid file_id, clearing: {e}")
             db.delete_cached_track(query)
 
@@ -673,12 +871,15 @@ async def do_search(message: types.Message, query: str):
 
     print_fmt = "after_move:%(title)s\t%(uploader)s\t%(filepath)s"
 
+    # Качество зависит от премиума
+    quality = "320K" if db.is_premium(message.from_user.id) else "192K"
+
     cmd = [
         "yt-dlp",
         f"scsearch1:{query}",
         "-x",
         "--audio-format", "mp3",
-        "--audio-quality", "192K",
+        "--audio-quality", quality,
         "-o", output_template,
         "--no-playlist",
         "--max-filesize", "25M",
@@ -857,6 +1058,7 @@ async def main():
         BotCommand(command="history", description="🕐 История"),
         BotCommand(command="wave", description="🌊 Случайный трек"),
         BotCommand(command="album", description="📀 Поиск по альбому"),
+        BotCommand(command="premium", description="⭐ Премиум"),
         BotCommand(command="donate", description="⭐ Поддержать проект"),
         BotCommand(command="help", description="❓ Помощь"),
     ]

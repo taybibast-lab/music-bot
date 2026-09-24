@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 DB_PATH = "music_bot.db"
 
@@ -57,7 +57,15 @@ def init_db():
         )
     """)
 
-    # Миграция старой БД — добавить artist если нет
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS premium (
+            user_id INTEGER PRIMARY KEY,
+            until TEXT,
+            bought_at TEXT
+        )
+    """)
+
+    # Миграция старой БД
     try:
         cur.execute("ALTER TABLE tracks ADD COLUMN artist TEXT")
     except sqlite3.OperationalError:
@@ -83,7 +91,6 @@ def add_user(user_id: int, username: str, first_name: str):
 # ============ CACHE ============
 
 def get_cached_track(query: str):
-    """(title, artist, file_id) или None."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
@@ -107,7 +114,6 @@ def cache_track(query: str, title: str, artist: str, file_id: str):
 
 
 def delete_cached_track(query: str):
-    """Удалить трек из кэша (если file_id протух)."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("DELETE FROM tracks WHERE query = ?", (query.lower().strip(),))
@@ -298,3 +304,136 @@ def is_liked(user_id: int, file_id: str) -> bool:
     row = cur.fetchone()
     conn.close()
     return row is not None
+
+
+# ============ PREMIUM ============
+
+def add_premium(user_id: int, days: int = 30):
+    """Дать/продлить премиум на N дней."""
+    now = datetime.now()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT until FROM premium WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+
+    if row and row[0] > now.isoformat():
+        old_until = datetime.fromisoformat(row[0])
+        new_until = (old_until + timedelta(days=days)).isoformat()
+        cur.execute("UPDATE premium SET until = ? WHERE user_id = ?", (new_until, user_id))
+    else:
+        new_until = (now + timedelta(days=days)).isoformat()
+        cur.execute("""
+            INSERT OR REPLACE INTO premium (user_id, until, bought_at)
+            VALUES (?, ?, ?)
+        """, (user_id, new_until, now.isoformat()))
+
+    conn.commit()
+    conn.close()
+
+
+def is_premium(user_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT until FROM premium WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return False
+    try:
+        return row[0] > datetime.now().isoformat()
+    except Exception:
+        return False
+
+
+def get_premium_until(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT until FROM premium WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+# ============ STATS (для админа) ============
+
+def get_total_users() -> int:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM users")
+    n = cur.fetchone()[0]
+    conn.close()
+    return n
+
+
+def get_users_today() -> int:
+    """Юзеры, которые зашли сегодня (по joined_at)."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM users WHERE joined_at LIKE ?", (f"{today}%",))
+    n = cur.fetchone()[0]
+    conn.close()
+    return n
+
+
+def get_tracks_today() -> int:
+    today = datetime.now().strftime("%Y-%m-%d")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM history WHERE played_at LIKE ?", (f"{today}%",))
+    n = cur.fetchone()[0]
+    conn.close()
+    return n
+
+
+def get_active_users_today() -> int:
+    """Юзеры, которые искали треки сегодня (уникальные)."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(DISTINCT user_id) FROM history WHERE played_at LIKE ?", (f"{today}%",))
+    n = cur.fetchone()[0]
+    conn.close()
+    return n
+
+
+def get_total_tracks() -> int:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM history")
+    n = cur.fetchone()[0]
+    conn.close()
+    return n
+
+
+def get_premium_count() -> int:
+    now = datetime.now().isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM premium WHERE until > ?", (now,))
+    n = cur.fetchone()[0]
+    conn.close()
+    return n
+
+
+def get_banned_count() -> int:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM banned")
+    n = cur.fetchone()[0]
+    conn.close()
+    return n
+
+
+def get_top_queries(limit: int = 5):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT query, COUNT(*) as cnt FROM history
+        GROUP BY query
+        ORDER BY cnt DESC
+        LIMIT ?
+    """, (limit,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
